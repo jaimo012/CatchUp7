@@ -8,7 +8,7 @@ from .rag_prep_service import prepare_final_data
 from .agenda_agent import generate_agenda
 from .script_agent import write_script
 from .slack_agent import format_slack_messages
-from .tts_service import generate_audio, cleanup_old_audios
+from .tts_service import generate_audio, cleanup_old_audios, build_audio_filename
 from .slack_service import send_main_message, send_thread_reply_with_file
 
 __all__ = [
@@ -21,6 +21,7 @@ __all__ = [
     "write_script",
     "format_slack_messages",
     "generate_audio",
+    "build_audio_filename",
     "cleanup_old_audios",
     "send_main_message",
     "send_thread_reply_with_file",

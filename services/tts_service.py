@@ -1,8 +1,14 @@
 import os
+import re
 import time
+import json
+from datetime import datetime
 from pathlib import Path
 
 import requests
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 
 from config.settings import settings
 from utils.logger import get_logger
@@ -10,17 +16,69 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-AUDIO_OUTPUT_DIR = "audio_output"
+AUDIO_OUTPUT_DIR = os.getenv("AUDIO_OUTPUT_DIR", "audio_output")
 DEFAULT_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
 ELEVENLABS_API_URL_TEMPLATE = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
 ELEVENLABS_MODEL_ID = "eleven_multilingual_v2"
 REQUEST_TIMEOUT_SECONDS = 60
 MAX_AUDIO_AGE_SECONDS = 24 * 60 * 60
+GOOGLE_DRIVE_AUDIO_FOLDER_ID = os.getenv("GOOGLE_DRIVE_AUDIO_FOLDER_ID", "103dM-wvNb8cUNfsGuMYA0vIOUa3mgLn6")
+GOOGLE_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
 
 def _ensure_audio_output_dir() -> str:
     os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True)
     return AUDIO_OUTPUT_DIR
+
+
+def _sanitize_filename_component(text: str) -> str:
+    sanitized = re.sub(r"[\\/:*?\"<>|]+", " ", text)
+    sanitized = re.sub(r"\s+", " ", sanitized).strip()
+    if not sanitized:
+        return "audio"
+    return sanitized[:80]
+
+
+def build_audio_filename(article_title: str, created_at: datetime | None = None) -> str:
+    current = created_at or datetime.now()
+    date_prefix = current.strftime("%y%m%d")
+    title_part = _sanitize_filename_component(article_title)
+    return f"{date_prefix}_{title_part}"
+
+
+def _upload_to_google_drive(local_file_path: Path) -> None:
+    if not GOOGLE_DRIVE_AUDIO_FOLDER_ID:
+        return
+
+    try:
+        credentials_info = json.loads(settings.GOOGLE_CREDENTIALS_JSON)
+        credentials = service_account.Credentials.from_service_account_info(
+            credentials_info,
+            scopes=GOOGLE_DRIVE_SCOPES,
+        )
+        drive_service = build("drive", "v3", credentials=credentials)
+
+        media = MediaFileUpload(str(local_file_path), mimetype="audio/mpeg", resumable=False)
+        file_metadata = {
+            "name": local_file_path.name,
+            "parents": [GOOGLE_DRIVE_AUDIO_FOLDER_ID],
+        }
+        created = (
+            drive_service.files()
+            .create(
+                body=file_metadata,
+                media_body=media,
+                fields="id,name,webViewLink",
+            )
+            .execute()
+        )
+        logger.info(
+            "Uploaded audio to Google Drive folder. file_id=%s, name=%s",
+            created.get("id"),
+            created.get("name"),
+        )
+    except Exception as exc:
+        logger.error("Google Drive upload failed for '%s': %s", local_file_path.name, exc)
 
 
 def generate_audio(text: str, filename: str) -> str | None:
@@ -58,7 +116,10 @@ def generate_audio(text: str, filename: str) -> str | None:
         logger.error("ElevenLabs API call failed for '%s': %s", filename, exc)
         return None
 
-    normalized_filename = filename if filename.endswith(".mp3") else f"{filename}.mp3"
+    normalized_filename = _sanitize_filename_component(filename)
+    normalized_filename = (
+        normalized_filename if normalized_filename.endswith(".mp3") else f"{normalized_filename}.mp3"
+    )
     output_path = Path(AUDIO_OUTPUT_DIR) / normalized_filename
 
     try:
@@ -67,6 +128,7 @@ def generate_audio(text: str, filename: str) -> str | None:
         logger.error("Failed to save audio file '%s': %s", output_path, exc)
         return None
 
+    _upload_to_google_drive(output_path)
     logger.info("Audio generated successfully: %s", output_path)
     return str(output_path.resolve())
 

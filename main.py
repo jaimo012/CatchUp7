@@ -11,6 +11,7 @@ from services import (
     GoogleSheetsClient,
     cleanup_old_audios,
     collect_daily_news,
+    build_audio_filename,
     filter_duplicate_articles,
     format_slack_messages,
     generate_agenda,
@@ -84,16 +85,41 @@ def run_daily_briefing() -> None:
 
         section_scripts = final_script_dict.get("sections", {})
         audio_paths: dict[str, str] = {}
-        now_prefix = datetime.now(APP_TIMEZONE).strftime("%Y%m%d_%H%M%S")
+        deep_dive_title_by_id = {
+            str(article.get("id", "")): str(article.get("title", "")).strip()
+            for article in deep_dive_articles
+        }
+        deep_dive_audio_key_by_id = {
+            str(article.get("id", "")): f"deep_dive_{index}"
+            for index, article in enumerate(deep_dive_articles, start=1)
+        }
+        section_title_fallback = {
+            "opening": "오프닝",
+            "short_brief": "단신 브리핑",
+            "closing": "클로징",
+        }
 
         if isinstance(section_scripts, dict):
             for section_key, section_text in section_scripts.items():
                 if not isinstance(section_text, str) or not section_text.strip():
                     continue
 
+                filename_title = section_title_fallback.get(section_key, section_key)
+                if section_key.startswith("deep_dive_"):
+                    matching_article_id = next(
+                        (
+                            article_id
+                            for article_id, audio_key in deep_dive_audio_key_by_id.items()
+                            if audio_key == section_key
+                        ),
+                        "",
+                    )
+                    if matching_article_id:
+                        filename_title = deep_dive_title_by_id.get(matching_article_id, filename_title)
+
                 audio_path = generate_audio(
                     text=section_text,
-                    filename=f"{now_prefix}_{section_key}",
+                    filename=build_audio_filename(filename_title, datetime.now(APP_TIMEZONE)),
                 )
                 if audio_path:
                     audio_paths[section_key] = audio_path
@@ -116,11 +142,6 @@ def run_daily_briefing() -> None:
             logger.error("Failed to send main Slack message. Stop thread replies.")
             cleanup_old_audios()
             return
-
-        deep_dive_audio_key_by_id = {
-            str(article.get("id", "")): f"deep_dive_{index}"
-            for index, article in enumerate(deep_dive_articles, start=1)
-        }
 
         for message in slack_messages:
             if not isinstance(message, dict):

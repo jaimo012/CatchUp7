@@ -93,6 +93,8 @@ NAVER_CLIENT_ID=your_naver_client_id
 NAVER_CLIENT_SECRET=your_naver_client_secret
 ELEVENLABS_API_KEY=your_elevenlabs_key
 ELEVENLABS_VOICE_ID=optional_voice_id
+AUDIO_OUTPUT_DIR=audio_output
+GOOGLE_DRIVE_AUDIO_FOLDER_ID=103dM-wvNb8cUNfsGuMYA0vIOUa3mgLn6
 SLACK_BOT_TOKEN=your_slack_bot_token
 SLACK_CHANNEL_ID=your_slack_channel_id
 GOOGLE_CREDENTIALS_JSON={"type":"service_account", ...}
@@ -105,6 +107,8 @@ SPREADSHEET_ID=your_google_spreadsheet_id
 - `NAVER_CLIENT_ID`, `NAVER_CLIENT_SECRET`: Naver 뉴스 검색 API 인증값
 - `ELEVENLABS_API_KEY`: ElevenLabs TTS API 키
 - `ELEVENLABS_VOICE_ID` (선택): 음성 ID (없으면 코드 기본값 사용)
+- `AUDIO_OUTPUT_DIR` (선택): 로컬 오디오 저장 폴더 (기본값 `audio_output`)
+- `GOOGLE_DRIVE_AUDIO_FOLDER_ID` (선택): 생성 오디오 업로드 대상 Google Drive 폴더 ID
 - `SLACK_BOT_TOKEN`: Slack Bot 토큰
 - `SLACK_CHANNEL_ID`: 메시지 전송 대상 채널 ID
 - `GOOGLE_CREDENTIALS_JSON`: 서비스 계정 JSON 문자열 전체
@@ -116,17 +120,31 @@ SPREADSHEET_ID=your_google_spreadsheet_id
 
 `SPREADSHEET_ID`가 가리키는 시트에서 아래 규칙으로 읽습니다.
 
-- `A2:A`: 검색 키워드 목록
-- `B2`: 분석 기준 프롬프트(한 셀)
+### 5.1 `Setting` 탭
+
+- 읽기 범위: `Setting!A2:B`
+- A열: 검색 키워드 목록 (빈 값 제외)
+- B열: 분석 방향 텍스트 (여러 행 가능, 빈 값 제외 후 줄바꿈으로 결합)
 
 `services/google_sheets_client.py`의 `get_config_data()`가 아래 구조로 반환합니다.
 
 ```python
 {
   "keywords": ["키워드1", "키워드2", ...],
-  "prompt_criteria": "분석 기준 프롬프트 텍스트"
+  "prompt_criteria": "분석 방향 1\n분석 방향 2\n..."
 }
 ```
+
+### 5.2 `News` 탭
+
+- 쓰기 범위: `News!A:E`
+- `append_news_to_sheet()`가 최종 선별 기사(심층 + 단신)를 append
+- 컬럼 순서:
+  - A: 수집일자 (`YYYY-MM-DD`)
+  - B: 발행일자 (`pubDate` 파싱 `YYYY-MM-DD`)
+  - C: 제목
+  - D: 요약 (너무 길면 200자 요약)
+  - E: 링크 (`originallink` 우선)
 
 ---
 
@@ -172,12 +190,13 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 2. `merge_by_url()`
 3. `filter_duplicate_articles()`
 4. `prepare_final_data()`
-5. `generate_agenda()`
-6. `write_script()`
-7. `format_slack_messages()`
-8. `generate_audio()` (섹션별)
-9. `send_main_message()` + `send_thread_reply_with_file()`
-10. `cleanup_old_audios()`
+5. `append_news_to_sheet()` (최종 선별 기사 DB 저장)
+6. `generate_agenda()`
+7. `write_script()`
+8. `format_slack_messages()`
+9. `generate_audio()` (섹션별)
+10. `send_main_message()` + `send_thread_reply_with_file()`
+11. `cleanup_old_audios()`
 
 예외 처리:
 
@@ -197,9 +216,12 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 ### 오디오 파일
 
-- 폴더: `audio_output/`
-- 파일명: `{timestamp}_{section_key}.mp3`
+- 기본 폴더: `audio_output/` (`AUDIO_OUTPUT_DIR`로 변경 가능)
+- 파일명: `{생성일자yymmdd}_{기사제목}.mp3`
 - 정리 정책: 생성 후 24시간이 지난 `.mp3` 자동 삭제
+- 저장 방식:
+  - 로컬 저장 후
+  - Google Drive 폴더(`GOOGLE_DRIVE_AUDIO_FOLDER_ID`) 업로드 시도
 
 ---
 
@@ -254,6 +276,11 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 - 모델 출력이 비거나 스키마를 벗어나면 fallback 처리됩니다.
 - `logs/app.log`에서 해당 agent 로그 확인
 
+### Google Drive 업로드 실패
+
+- 서비스 계정 이메일이 대상 폴더에 편집 권한으로 공유되어 있는지 확인
+- `GOOGLE_DRIVE_AUDIO_FOLDER_ID`가 올바른지 확인
+
 ### 크롤링 텍스트가 빈 문자열
 
 - 언론사 차단/구조 변경 가능성이 있습니다.
@@ -276,4 +303,40 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 - Slack 전송 재시도 큐
 - `requirements.txt` 고정 및 CI 파이프라인
 - `/health` 엔드포인트 추가
+
+---
+
+## 14) 대본 품질/TTS 작성 규칙
+
+`services/script_agent.py`는 아래 규칙을 프롬프트에 반영해 대본을 생성합니다.
+
+- 친근한 설명 톤을 유지하되, 분석 깊이와 전문성 확보
+- 심층 기사에서 배경/쟁점/영향/전망을 구조적으로 설명
+- 어려운 용어가 있으면 섹션 마지막에 1~2개 짧게 풀이
+- TTS 최적화 표기:
+  - 쉼표(,)로 속도 조절
+  - 대시(-)로 끊어 읽기
+  - 줄임표(...)로 여운
+  - 단락 전환 시 `\n\n` 사용
+  - 숫자/영문은 한글 발음으로 풀기
+  - 괄호 병기(한글+영문 동시 표기) 지양
+
+---
+
+## 15) 업데이트 이력
+
+> 원칙: 기능 변경 시 이 섹션에 계속 누적 기록합니다.
+
+### 2026-03-06
+
+- Google Sheets 구조를 `Setting`/`News` 2탭으로 반영
+  - `Setting!A2:B` 읽기
+  - `News!A:E` append 저장
+- 파이프라인에서 선별 직후 `append_news_to_sheet()` 호출 추가
+- 오디오 파일명 규칙 변경
+  - `{생성일자yymmdd}_{기사제목}.mp3`
+- 오디오 저장 경로 확장
+  - 로컬(`AUDIO_OUTPUT_DIR`) + Google Drive 업로드
+- 스크립트 프롬프트 강화
+  - 전문성 강화, 용어 설명 추가, TTS 친화적 표기 규칙 반영
 
